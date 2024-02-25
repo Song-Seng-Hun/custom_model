@@ -11,6 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+import sys, os
+sys.path.append(os.path.dirname(os.path.abspath(os.path.dirname(__file__))))
+
 import argparse
 import contextlib
 import random
@@ -21,7 +25,6 @@ import torch
 from gemma import config
 from gemma import model as gemma_model
 
-
 @contextlib.contextmanager
 def _set_default_tensor_type(dtype: torch.dtype):
     """Sets the default torch dtype to the given dtype."""
@@ -31,21 +34,27 @@ def _set_default_tensor_type(dtype: torch.dtype):
 
 
 def main(args):
-    # Construct the model config.
-    model_config = config.get_model_config(args.variant)
-    model_config.dtype = "float32" if args.device == "cpu" else "float16"
-    model_config.quant = args.quant
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=True, enable_mem_efficient=True)
 
+    # Construct the model config.
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    model_config = config.get_model_config(args.variant)
+    model_config.dtype = "float32" if device == "cpu" else "float16"
+    model_config.quant = args.quant
+    
     # Seed random.
+    os.environ['PYTHONHASHSEED'] = str(args.seed)
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
 
     # Create the model and load the weights.
-    device = torch.device(args.device)
     with _set_default_tensor_type(model_config.get_dtype()):
         model = gemma_model.GemmaForCausalLM(model_config)
-        model.load_weights(args.ckpt)
+        if args.ckpt is not None:
+            model.load_weights(args.ckpt)
         model = model.to(device).eval()
     print("Model loading done")
 
@@ -61,15 +70,11 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--ckpt", type=str, required=True)
+    parser.add_argument("--ckpt", type=str, default=None)
     parser.add_argument("--variant",
                         type=str,
                         default="2b",
                         choices=["2b", "7b"])
-    parser.add_argument("--device",
-                        type=str,
-                        default="cpu",
-                        choices=["cpu", "cuda"])
     parser.add_argument("--output_len", type=int, default=4)
     parser.add_argument("--seed", type=int, default=12345)
     parser.add_argument("--quant", action='store_true')
