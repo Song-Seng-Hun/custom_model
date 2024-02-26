@@ -20,8 +20,7 @@ import torch.nn.functional as F
 from typing import Any, List, Optional, Sequence, Tuple, Union
 
 from gemma import config as gemma_config
-from gemma import tokenizer
-
+from gemma import tokenizer, autoencoder
 
 class Sampler(nn.Module):
 
@@ -89,7 +88,39 @@ def precompute_freqs_cis(dim: int,
     t = torch.arange(end, device=freqs.device)
     freqs = torch.outer(t, freqs).float()
     freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
+    print(freqs_cis.shape)
     return freqs_cis
+
+
+def precompute_freqs_cis_2d(dim: int,
+                            height: int,
+                            width: int,
+                            theta: float = 10000.0) -> torch.Tensor:
+    freqs_h = 1.0 / (theta ** (torch.arange(0, dim, 2)[:dim // 2].float() / dim))
+    freqs_w = 1.0 / (theta ** (torch.arange(0, dim, 2)[:dim // 2].float() / dim))
+    t_h = torch.arange(height, device=freqs_h.device)
+    t_w = torch.arange(width, device=freqs_w.device)
+    freqs_h = torch.outer(t_h, freqs_h).float()
+    freqs_w = torch.outer(t_w, freqs_w).float()
+    freqs_2d = torch.einsum('h,w->hw', [freqs_h, freqs_w])
+    freqs_cis_2d = torch.polar(torch.ones_like(freqs_2d), freqs_2d)
+
+    return freqs_cis_2d
+
+def precompute_freqs_cis_3d(dim: int, height: int, width: int, time: int, theta: float = 10000.0) -> torch.Tensor:
+    freqs_h = 1.0 / (theta ** (torch.arange(0, dim, 2)[:dim // 2].float() / dim))
+    freqs_w = 1.0 / (theta ** (torch.arange(0, dim, 2)[:dim // 2].float() / dim))
+    freqs_t = 1.0 / (theta ** (torch.arange(0, dim, 2)[:dim // 2].float() / dim))
+    t_h = torch.arange(height, device=freqs_h.device)
+    t_w = torch.arange(width, device=freqs_w.device)
+    t_t = torch.arange(time, device=freqs_t.device)
+    freqs_h = torch.outer(t_h, freqs_h).float()
+    freqs_w = torch.outer(t_w, freqs_w).float()
+    freqs_t = torch.outer(t_t, freqs_t).float()
+    freqs_3d = torch.einsum('h,w,t->hwt', [freqs_h, freqs_w, freqs_t])
+    freqs_cis_3d = torch.polar(torch.ones_like(freqs_3d), freqs_3d)
+
+    return freqs_cis_3d
 
 
 def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
@@ -383,6 +414,7 @@ class GemmaModel(nn.Module):
         return hidden_states
 
 
+# 모델 본체
 class GemmaForCausalLM(nn.Module):
 
     def __init__(
@@ -408,6 +440,7 @@ class GemmaForCausalLM(nn.Module):
                                          max_seq_len * 2,
                                          theta=rope_theta)
         self.register_buffer('freqs_cis', freqs_cis)
+        self.modal = 'text'
 
     @torch.no_grad()
     def forward(
@@ -423,14 +456,19 @@ class GemmaForCausalLM(nn.Module):
         top_ks: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
-        freqs_cis = self.freqs_cis.index_select(0, input_positions)
-        kv_write_indices = input_positions
+        if self.modal == 'text':
+            freqs_cis = self.freqs_cis.index_select(0, input_positions)
+            kv_write_indices = input_positions
 
-        # [batch_size, input_len, hidden_size]
-        hidden_states = self.embedder(input_token_ids)
-        # Gemma normalizes the embedding by sqrt(hidden_size).
-        hidden_states = hidden_states * (self.config.hidden_size**0.5)
+            # [batch_size, input_len, hidden_size]
+            hidden_states = self.embedder(input_token_ids)
+            # Gemma normalizes the embedding by sqrt(hidden_size).
+            hidden_states = hidden_states * (self.config.hidden_size**0.5)
 
+        #################### 모달 분리 지점 #################
+
+        # 여기가 대충 encoder 결과물(BS, -1, CH)
+        # print(hidden_states.shape, self.config.hidden_size)
         hidden_states = self.model(
             hidden_states=hidden_states,
             freqs_cis=freqs_cis,
@@ -438,6 +476,7 @@ class GemmaForCausalLM(nn.Module):
             kv_caches=kv_caches,
             mask=mask,
         )
+        # 여기서 나오는게 feature?
         embedder_weight = self.embedder.weight
         if self.config.quant:
             embedder_weight = (
@@ -496,7 +535,7 @@ class GemmaForCausalLM(nn.Module):
                 p[:min_prompt_len])
         token_ids_tensor = token_ids_tensor.to(device)
         input_token_ids_tensor = input_token_ids_tensor.to(device)
-        prompt_mask_tensor = token_ids_tensor != self.tokenizer.pad_id
+        prompt_mask_tensor = token_ids_tensor != self.tokenizer.pad_id # 들어있는것만 마스킹
         input_positions_tensor = torch.arange(0, min_prompt_len,
                                               dtype=torch.int64).to(device)
         mask_tensor = torch.full((1, 1, max_seq_len, max_seq_len),
@@ -549,18 +588,19 @@ class GemmaForCausalLM(nn.Module):
         for i, tokens in enumerate(token_ids):
             trimmed_output = tokens[len(prompt_tokens[i]):len(prompt_tokens[i])
                                     + output_len]
+            ## 종료 조건 -> 잘라내기
             if self.tokenizer.eos_id in trimmed_output:
                 eos_index = trimmed_output.index(self.tokenizer.eos_id)
                 trimmed_output = trimmed_output[:eos_index]
             results.append(self.tokenizer.decode(trimmed_output))
-
+        print(results)
         # If a string was provided as input, return a string as output.
         return results[0] if is_str_prompt else results
 
     def load_weights(self, model_path: str):
         self.load_state_dict(
             torch.load(
-                model_path, mmap=True, weights_only=True,
+                model_path, weights_only=True,
             )['model_state_dict'],
             strict=False,
         )
