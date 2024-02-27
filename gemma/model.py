@@ -88,7 +88,7 @@ def precompute_freqs_cis(dim: int,
     t = torch.arange(end, device=freqs.device)
     freqs = torch.outer(t, freqs).float()
     freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
-    print(freqs_cis.shape)
+    # print(freqs_cis.shape)
     return freqs_cis
 
 
@@ -433,7 +433,8 @@ class GemmaForCausalLM(nn.Module):
         self.embedder = Embedding(vocab_size, config.hidden_size, config.quant)
         self.model = GemmaModel(config)
         self.sampler = Sampler(vocab_size)
-
+        self.text_encoder = autoencoder.TextEncoder()
+        self.text_decoder = autoencoder.TextDecoder()
         # Pre-compute rotary embedding table.
         rope_theta = getattr(config, 'rope_theta', 10000)
         freqs_cis = precompute_freqs_cis(head_dim,
@@ -456,19 +457,12 @@ class GemmaForCausalLM(nn.Module):
         top_ks: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
+        freqs_cis = self.freqs_cis.index_select(0, input_positions)
         if self.modal == 'text':
-            freqs_cis = self.freqs_cis.index_select(0, input_positions)
-            kv_write_indices = input_positions
-
-            # [batch_size, input_len, hidden_size]
-            hidden_states = self.embedder(input_token_ids)
-            # Gemma normalizes the embedding by sqrt(hidden_size).
-            hidden_states = hidden_states * (self.config.hidden_size**0.5)
-
-        #################### 모달 분리 지점 #################
+            freqs_cis, kv_write_indices, hidden_states = self.text_encoder(freqs_cis, input_positions, self.embedder, input_token_ids, self.config.hidden_size)
 
         # 여기가 대충 encoder 결과물(BS, -1, CH)
-        # print(hidden_states.shape, self.config.hidden_size)
+        print(hidden_states.shape, self.config.hidden_size)
         hidden_states = self.model(
             hidden_states=hidden_states,
             freqs_cis=freqs_cis,
@@ -476,19 +470,9 @@ class GemmaForCausalLM(nn.Module):
             kv_caches=kv_caches,
             mask=mask,
         )
-        # 여기서 나오는게 feature?
-        embedder_weight = self.embedder.weight
-        if self.config.quant:
-            embedder_weight = (
-                embedder_weight * self.embedder.weight_scaler.unsqueeze(-1))
-        next_tokens = self.sampler(
-            embedding=embedder_weight,
-            hidden_states=hidden_states,
-            output_positions=output_positions,
-            temperatures=temperatures,
-            top_ps=top_ps,
-            top_ks=top_ks,
-        )
+        if self.modal == 'text':
+            next_tokens = self.text_decoder(self.embedder, self.config.quant, self.sampler, hidden_states, output_positions, temperatures, top_ps, top_ks)
+
         return next_tokens
 
     def generate(
@@ -524,7 +508,7 @@ class GemmaForCausalLM(nn.Module):
             v_cache = torch.zeros(size=size, dtype=dtype, device=device)
             kv_caches.append((k_cache, v_cache))
 
-            # prepare inputs
+        # prepare inputs
         if self.modal == 'text':
             token_ids_tensor = torch.full((batch_size, max_seq_len),
                                         self.tokenizer.pad_id, dtype=torch.int64)
