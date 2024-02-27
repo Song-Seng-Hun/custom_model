@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Inference-only Gemma model implementation."""
-
+import sys, os
+sys.path.append("/home/medi/LLM/gemma_pytorch/") 
 import re
 import torch
 from torch import nn
@@ -435,8 +436,10 @@ class GemmaForCausalLM(nn.Module):
         self.sampler = Sampler(vocab_size)
         self.text_encoder = autoencoder.TextEncoder()
         self.text_decoder = autoencoder.TextDecoder()
-        self.text_patchfier = autoencoder.TextPatchfier()
+        self.text_preprocess = autoencoder.TextPreprocess()
         self.text_generator = autoencoder.TextGenerator()
+        self.encoder1d = autoencoder.Encoder1d()
+        self.generator1d = autoencoder.Generator1d()
         # Pre-compute rotary embedding table.
         rope_theta = getattr(config, 'rope_theta', 10000)
         freqs_cis = precompute_freqs_cis(head_dim,
@@ -464,7 +467,8 @@ class GemmaForCausalLM(nn.Module):
             freqs_cis, kv_write_indices, hidden_states = self.text_encoder(freqs_cis, input_positions, self.embedder, input_token_ids, self.config.hidden_size)
 
         # 여기가 대충 encoder 결과물(BS, -1, CH)
-        print(hidden_states.shape, self.config.hidden_size)
+        # print(hidden_states.shape, self.config.hidden_size) # for debug
+
         hidden_states = self.model(
             hidden_states=hidden_states,
             freqs_cis=freqs_cis,
@@ -479,32 +483,38 @@ class GemmaForCausalLM(nn.Module):
 
     def generate(
         self,
-        prompts: Union[str, Sequence[str]],
+        data: Any,
         device: Any,
         output_len: int = 100,
         temperature: float = 0.95,
         top_p: float = 1.0,
         top_k: int = 100,
-    ) -> Union[str, Sequence[str]]:
+    ) -> Any:
         """Generates responses for given prompts using Gemma model."""
-        # If a single prompt is provided, treat it as a batch of 1.
         if self.modal == 'text':
-            is_str_prompt, prompts, batch_size, prompt_tokens, min_prompt_len, max_prompt_len, max_seq_len = self.text_patchfier(prompts, self.tokenizer, output_len, self.config.max_position_embeddings)
+            is_str_prompt, batch_size, data, min_prompt_len, max_seq_len = self.text_preprocess(data, self.tokenizer, output_len, self.config.max_position_embeddings)
+        elif self.modal == 'audio':
+            dtype = self.config.get_dtype()
+            data = self.encoder1d(data, device, dtype)
+            max_seq_len = data.shape[-2]
+            batch_size = data.shape[0]
 
         # build KV caches
         kv_caches = []
         for _ in range(self.config.num_hidden_layers):
-            size = (batch_size, max_seq_len, self.config.num_key_value_heads,
-                    self.config.head_dim)
+            size = (batch_size, max_seq_len, self.config.num_key_value_heads, self.config.head_dim)
             dtype = self.config.get_dtype()
             k_cache = torch.zeros(size=size, dtype=dtype, device=device)
             v_cache = torch.zeros(size=size, dtype=dtype, device=device)
             kv_caches.append((k_cache, v_cache))
 
+        text_results, audio_results = None, None
         # prepare inputs
         if self.modal == 'text':
-            text_results = self.text_generator(self.forward, batch_size, max_seq_len, self.tokenizer, min_prompt_len, prompt_tokens, device, temperature, top_p, top_k, kv_caches, output_len, is_str_prompt)
-        return {'text_results': text_results}
+            text_results = self.text_generator(self.forward, batch_size, max_seq_len, self.tokenizer, min_prompt_len, data, device, temperature, top_p, top_k, kv_caches, output_len, is_str_prompt)
+        elif self.modal == 'audio':
+            audio_results = self.generator1d(self.forward, batch_size, max_seq_len, self.tokenizer, min_prompt_len, data, device, temperature, top_p, top_k, kv_caches, output_len, is_str_prompt)
+        return {'text_results': text_results, 'audio_results': audio_results}
 
     def load_weights(self, model_path: str):
         self.load_state_dict(
