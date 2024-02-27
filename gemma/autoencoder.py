@@ -33,12 +33,14 @@ class TextDecoder(nn.Module):
         )
         return next_tokens
     
-class TextPatchfier(nn.Module):
+
+class TextPreprocess(nn.Module):
     def __init__(self):
-        super(TextPatchfier, self).__init__()
+        super(TextPreprocess, self).__init__()
 
     def forward(self, prompts, tokenizer, output_len, max_position_embeddings):
         is_str_prompt = isinstance(prompts, str)        
+        # If a single prompt is provided, treat it as a batch of 1.
         if is_str_prompt:
             prompts = [prompts]
 
@@ -48,7 +50,7 @@ class TextPatchfier(nn.Module):
         max_prompt_len = max(len(p) for p in prompt_tokens)
         max_seq_len = max_prompt_len + output_len
         assert max_seq_len <= max_position_embeddings
-        return is_str_prompt, prompts, batch_size, prompt_tokens, min_prompt_len, max_prompt_len, max_seq_len
+        return is_str_prompt, batch_size, prompt_tokens, min_prompt_len, max_seq_len
 
 
 class TextGenerator(nn.Module):
@@ -87,7 +89,7 @@ class TextGenerator(nn.Module):
         for i in range(max_seq_len - min_prompt_len):
             next_token_ids = forward(
                 input_token_ids=input_token_ids_tensor,
-                input_positions=input_positions_tensor,
+                input_positions=input_positions_tensor, ## 여기서 포지션 정보 넘어감
                 kv_write_indices=None,
                 kv_caches=kv_caches,
                 mask=curr_mask_tensor,
@@ -137,7 +139,8 @@ class Encoder1d(nn.Module):
         if model_path is not None:
             self.load_state_dict(torch.load(model_path), False)
 
-    def forward(self, x):
+    def forward(self, x, device='cuda', dtype=torch.float):
+        x = x.type(dtype).to(device)
         if len(x.shape) != 3:
             x = x.unsqueeze(0)
         if x.shape[-3] < 2:
@@ -148,6 +151,7 @@ class Encoder1d(nn.Module):
         residual = x
         x = self.conv1d(x)
         x = x + residual
+
         return x.permute(0,2,1)
     
 class Decoder1d(nn.Module):
@@ -170,6 +174,70 @@ class Decoder1d(nn.Module):
         if self.resize is not None:
             x = audio_F.resample(x, x.shape[-1], self.resize, lowpass_filter_width=6)
         return x
+
+##수정 필요
+class Generator1d(nn.Module):
+    def __init__(self):
+        super(Generator1d, self).__init__()
+    def forward(self, forward, batch_size, data, device, temperature, top_p, top_k, kv_caches, output_len, is_str_prompt):
+        print(data.shape)
+        mask_tensor = torch.full((1, 1, data.shape[-2], data.shape[-2]),
+                                -2.3819763e38).to(torch.float)
+        mask_tensor = torch.triu(mask_tensor, diagonal=1).to(device)
+        # curr_mask_tensor = mask_tensor.index_select(2, input_positions_tensor)
+        # output_positions_tensor = torch.LongTensor([min_prompt_len - 1]).to(
+        #     device)
+        # temperatures_tensor = torch.FloatTensor([temperature] * batch_size).to(
+        #     device)
+        # top_ps_tensor = torch.FloatTensor([top_p] * batch_size).to(device)
+        # top_ks_tensor = torch.LongTensor([top_k] * batch_size).to(device)
+        # output_index = torch.tensor(min_prompt_len, dtype=torch.int64).to(
+        #     device)
+        
+        # # Prefill up to min_prompt_len tokens, then treat other prefill as
+        # # decode and ignore output.
+        # for i in range(max_seq_len - min_prompt_len):
+        #     next_token_ids = forward(
+        #         input_token_ids=input_token_ids_tensor,
+        #         input_positions=input_positions_tensor, ## 여기서 포지션 정보 넘어감
+        #         kv_write_indices=None,
+        #         kv_caches=kv_caches,
+        #         mask=curr_mask_tensor,
+        #         output_positions=output_positions_tensor,
+        #         temperatures=temperatures_tensor,
+        #         top_ps=top_ps_tensor,
+        #         top_ks=top_ks_tensor,
+        #     )
+
+        #     curr_prompt_mask = prompt_mask_tensor.index_select(
+        #         1, output_index).squeeze(dim=1)
+        #     curr_token_ids = token_ids_tensor.index_select(
+        #         1, output_index).squeeze(dim=1)
+        #     output_token_ids = torch.where(curr_prompt_mask, curr_token_ids,
+        #                                 next_token_ids).unsqueeze(dim=1)
+        #     token_ids_tensor.index_copy_(1, output_index, output_token_ids)
+
+        #     input_token_ids_tensor = output_token_ids
+        #     input_positions_tensor = output_index.unsqueeze(dim=-1)
+        #     curr_mask_tensor = mask_tensor.index_select(2,
+        #                                                 input_positions_tensor)
+        #     output_positions_tensor = torch.tensor(0, dtype=torch.int64).to(
+        #         device)
+        #     output_index = output_index + 1
+        # # Detokenization.
+        # token_ids = token_ids_tensor.tolist()
+        # text_results = []
+        # for i, tokens in enumerate(token_ids):
+        #     trimmed_output = tokens[len(prompt_tokens[i]):len(prompt_tokens[i])
+        #                             + output_len]
+        #     ## 종료 조건 -> 잘라내기
+        #     if tokenizer.eos_id in trimmed_output:
+        #         eos_index = trimmed_output.index(tokenizer.eos_id)
+        #         trimmed_output = trimmed_output[:eos_index]
+        #     text_results.append(tokenizer.decode(trimmed_output))
+        # # If a string was provided as input, return a string as output.
+        # text_results = text_results[0] if is_str_prompt else text_results
+        # return text_results
     
 
 class Encoder2d(nn.Module):
@@ -196,8 +264,10 @@ class Encoder2d(nn.Module):
         x = self.conv2d(x)
         x = x + residual
         self.feature_shape = x.shape
-        x = x.reshape(1, self.embed_dim, -1)
-        return x.permute(0,2,1)
+
+        return x
+        # x = x.reshape(1, self.embed_dim, -1)
+        # return x.permute(0,2,1)
     
 class Decoder2d(nn.Module):
     def __init__(self, resize=None, patch_size=(16,16), embed_dim=2048, model_path=None):
