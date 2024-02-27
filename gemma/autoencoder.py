@@ -5,36 +5,33 @@ import torchaudio.transforms as audio_T
 import librosa
 import numpy as np
 
-def precompute_freqs_cis_2d(dim: int,
-                            height: int,
-                            width: int,
-                            theta: float = 10000.0) -> torch.Tensor:
-    freqs_h = 1.0 / (theta ** (torch.arange(0, dim, 2)[:dim // 2].float() / dim))
-    freqs_w = 1.0 / (theta ** (torch.arange(0, dim, 2)[:dim // 2].float() / dim))
-    t_h = torch.arange(height, device=freqs_h.device)
-    t_w = torch.arange(width, device=freqs_w.device)
-    freqs_h = torch.outer(t_h, freqs_h).float()
-    freqs_w = torch.outer(t_w, freqs_w).float()
-    freqs_2d = torch.einsum('h,w->hw', [freqs_h, freqs_w])
-    freqs_cis_2d = torch.polar(torch.ones_like(freqs_2d), freqs_2d)
+class TextEncoder(nn.Module):
+    def __init__(self):
+        super(TextEncoder, self).__init__()
 
-    return freqs_cis_2d
-
-def precompute_freqs_cis_3d(dim: int, height: int, width: int, time: int, theta: float = 10000.0) -> torch.Tensor:
-    freqs_h = 1.0 / (theta ** (torch.arange(0, dim, 2)[:dim // 2].float() / dim))
-    freqs_w = 1.0 / (theta ** (torch.arange(0, dim, 2)[:dim // 2].float() / dim))
-    freqs_t = 1.0 / (theta ** (torch.arange(0, dim, 2)[:dim // 2].float() / dim))
-    t_h = torch.arange(height, device=freqs_h.device)
-    t_w = torch.arange(width, device=freqs_w.device)
-    t_t = torch.arange(time, device=freqs_t.device)
-    freqs_h = torch.outer(t_h, freqs_h).float()
-    freqs_w = torch.outer(t_w, freqs_w).float()
-    freqs_t = torch.outer(t_t, freqs_t).float()
-    freqs_3d = torch.einsum('h,w,t->hwt', [freqs_h, freqs_w, freqs_t])
-    freqs_cis_3d = torch.polar(torch.ones_like(freqs_3d), freqs_3d)
-
-    return freqs_cis_3d
-
+    def forward(self, freqs_cis, input_positions, embedder, input_token_ids, hidden_size):
+        kv_write_indices = input_positions
+        hidden_states = embedder(input_token_ids)
+        hidden_states = hidden_states * (hidden_size**0.5)
+        return freqs_cis, kv_write_indices, hidden_states
+    
+class TextDecoder(nn.Module):
+    def __init__(self):
+        super(TextDecoder, self).__init__()
+    def forward(self, embedder, quant, sampler, hidden_states, output_positions, temperatures, top_ps, top_ks):
+        embedder_weight = embedder.weight
+        if quant:
+            embedder_weight = (
+                embedder_weight * embedder.weight_scaler.unsqueeze(-1))
+        next_tokens = sampler(
+            embedding=embedder_weight,
+            hidden_states=hidden_states,
+            output_positions=output_positions,
+            temperatures=temperatures,
+            top_ps=top_ps,
+            top_ks=top_ks,
+        )
+        return next_tokens
 
 class Encoder1d(nn.Module):
     def __init__(self, resize=None, patch_size=128, embed_dim=2048, model_path=None):
@@ -88,10 +85,6 @@ class Encoder2d(nn.Module):
         self.feature_shape = None
         self.patchfier2d = nn.Conv2d(4, embed_dim, patch_size, patch_size)
         self.conv2d = nn.Conv2d(embed_dim, embed_dim, 3, 1, 1)
-        freqs_cis = precompute_freqs_cis_2d(head_dim,
-                                         max_seq_len * 2,
-                                         theta=rope_theta)
-        self.register_buffer('freqs_cis', freqs_cis)
         if model_path is not None:
             self.load_state_dict(torch.load(model_path), False)
 
@@ -189,8 +182,8 @@ if __name__ == '__main__':
     print("Start testing...")
     
     ## audio
-    # test_audio = torch.rand(1, 1, 5200)
-    # encoder = Encoder1d(resize=520)
+    test_audio = torch.rand(1, 1, 5200)
+    encoder = Encoder1d(resize=520)
     # decoder = Decoder1d(resize=5200)
     # print(decoder(encoder(test_audio)).shape)
 
