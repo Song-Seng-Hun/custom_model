@@ -453,6 +453,7 @@ class GemmaForCausalLM(nn.Module):
     ) -> torch.Tensor:
         # [batch_size, input_len, hidden_size]
         hidden_states = self.embedder(input_token_ids)
+        # Gemma normalizes the embedding by sqrt(hidden_size).
         hidden_states = hidden_states*(self.config.hidden_size**0.5)
         hidden_states = self.model(
             hidden_states=hidden_states,
@@ -503,6 +504,7 @@ class GemmaForCausalLM(nn.Module):
         input_token_ids_tensor = torch.full((batch_size, min_prompt_len),
                                             self.tokenizer.pad_id,
                                             dtype=torch.int64)
+        
         for i, p in enumerate(prompt_tokens):
             token_ids_tensor[i, :len(p)] = torch.tensor(p)
             input_token_ids_tensor[i, :min_prompt_len] = torch.tensor(
@@ -520,12 +522,12 @@ class GemmaForCausalLM(nn.Module):
         temperatures_tensor = torch.FloatTensor([temperature] * batch_size).to(device)
         top_ps_tensor = torch.FloatTensor([top_p] * batch_size).to(device)
         top_ks_tensor = torch.LongTensor([top_k] * batch_size).to(device)
+        # Prefill up to min_prompt_len tokens, then treat other prefill as
         output_index = torch.tensor(min_prompt_len, dtype=torch.int64).to(device)
 
-        # Prefill up to min_prompt_len tokens, then treat other prefill as
+        
         # decode and ignore output.
         for i in range(max_seq_len - min_prompt_len):
-            # Gemma normalizes the embedding by sqrt(hidden_size).
             hidden_states = self(
                 input_token_ids=input_token_ids_tensor,
                 freqs_cis=self.freqs_cis.index_select(0, input_positions_tensor),
@@ -563,6 +565,7 @@ class GemmaForCausalLM(nn.Module):
             output_positions_tensor = torch.tensor(0, dtype=torch.int64).to(device)
             output_index = output_index + 1
 
+        # Detokinization
         token_ids = token_ids_tensor.tolist()
         results = []
         for i, tokens in enumerate(token_ids):
@@ -573,7 +576,9 @@ class GemmaForCausalLM(nn.Module):
                 trimmed_output = trimmed_output[:eos_index]
             results.append(self.tokenizer.decode(trimmed_output))
 
+        # If a string was provided as input, return a string as output.
         return results[0] if is_str_prompt else results
+    
     def load_weights(self, model_path: str):
         self.load_state_dict(
             torch.load(
