@@ -1,5 +1,5 @@
-import sys 
-sys.path.append("/home/medi/LLM/gemma_pytorch/") 
+import sys, os
+sys.path.append(os.path.dirname(os.path.abspath(os.path.dirname(__file__))))
 from gemma.config import GemmaConfig, get_config_for_7b, get_config_for_2b
 from gemma.model import GemmaForCausalLM
 from gemma.tokenizer import Tokenizer
