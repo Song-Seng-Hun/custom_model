@@ -1,5 +1,5 @@
-import sys 
-sys.path.append("/home/medi/LLM/gemma_pytorch/") 
+import sys, os
+sys.path.append(os.path.dirname(os.path.abspath(os.path.dirname(__file__))))
 from gemma.tokenizer import Tokenizer
 import sentencepiece as spm
 tokenizer = Tokenizer('/home/medi/LLM/gemma_pytorch/tokenizer/tokenizer.model')
