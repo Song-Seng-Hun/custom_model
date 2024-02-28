@@ -13,7 +13,7 @@
 # limitations under the License.
 """Inference-only Gemma model implementation."""
 import sys, os
-sys.path.append("/home/medi/LLM/gemma_pytorch/") 
+sys.path.append(os.path.dirname(os.path.abspath(os.path.dirname(__file__))))
 import re
 import torch
 from torch import nn
@@ -444,17 +444,16 @@ class GemmaForCausalLM(nn.Module):
 
     def forward(
         self,
-        hidden_states: torch.Tensor,
+        input_token_ids: torch.Tensor,
         freqs_cis: torch.Tensor,
         kv_write_indices: torch.Tensor,
         kv_caches: List[Tuple[torch.Tensor, torch.Tensor]],
         mask: torch.Tensor,
-        output_positions: torch.Tensor,
-        temperatures: torch.Tensor,
-        top_ps: torch.Tensor,
-        top_ks: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
+        # [batch_size, input_len, hidden_size]
+        hidden_states = self.embedder(input_token_ids)
+        hidden_states = hidden_states*(self.config.hidden_size**0.5)
         hidden_states = self.model(
             hidden_states=hidden_states,
             freqs_cis=freqs_cis,
@@ -467,21 +466,22 @@ class GemmaForCausalLM(nn.Module):
 
     def generate(
         self,
-        prompts: Union[str, Sequence[str]],
+        datas: Union[str, Sequence[str]],
         device: Any,
         output_len: int = 100,
         temperature: float = 0.95,
         top_p: float = 1.0,
         top_k: int = 100,
     ) -> Union[str, Sequence[str]]:
-        """Generates responses for given prompts using Gemma model."""
-        # If a single prompt is provided, treat it as a batch of 1.
-        is_str_prompt = isinstance(prompts, str)
-        if is_str_prompt:
-            prompts = [prompts]
+        """Generates responses for given datas using Gemma model."""
 
-        batch_size = len(prompts)
-        prompt_tokens = [self.tokenizer.encode(prompt) for prompt in prompts]
+        # If a single prompt is provided, treat it as a batch of 1.
+        is_str_prompt = isinstance(datas, str)
+        if is_str_prompt:
+            datas = [datas]
+
+        batch_size = len(datas)
+        prompt_tokens = [self.tokenizer.encode(prompt) for prompt in datas]
         min_prompt_len = min(len(p) for p in prompt_tokens)
         max_prompt_len = max(len(p) for p in prompt_tokens)
         max_seq_len = max_prompt_len + output_len
@@ -516,36 +516,29 @@ class GemmaForCausalLM(nn.Module):
                                  -2.3819763e38).to(torch.float)
         mask_tensor = torch.triu(mask_tensor, diagonal=1).to(device)
         curr_mask_tensor = mask_tensor.index_select(2, input_positions_tensor)
-        output_positions_tensor = torch.LongTensor([min_prompt_len - 1]).to(
-            device)
-        temperatures_tensor = torch.FloatTensor([temperature] * batch_size).to(
-            device)
+        output_positions_tensor = torch.LongTensor([min_prompt_len - 1]).to(device)
+        temperatures_tensor = torch.FloatTensor([temperature] * batch_size).to(device)
         top_ps_tensor = torch.FloatTensor([top_p] * batch_size).to(device)
         top_ks_tensor = torch.LongTensor([top_k] * batch_size).to(device)
-        output_index = torch.tensor(min_prompt_len, dtype=torch.int64).to(
-            device)
+        output_index = torch.tensor(min_prompt_len, dtype=torch.int64).to(device)
 
         # Prefill up to min_prompt_len tokens, then treat other prefill as
         # decode and ignore output.
         for i in range(max_seq_len - min_prompt_len):
-            # [batch_size, input_len, hidden_size]
-            hidden_states = self.embedder(input_token_ids_tensor)
             # Gemma normalizes the embedding by sqrt(hidden_size).
             hidden_states = self(
-                hidden_states=hidden_states*(self.config.hidden_size**0.5),
+                input_token_ids=input_token_ids_tensor,
                 freqs_cis=self.freqs_cis.index_select(0, input_positions_tensor),
                 kv_write_indices=input_positions_tensor,
                 kv_caches=kv_caches,
-                mask=curr_mask_tensor,
-                output_positions=output_positions_tensor,
-                temperatures=temperatures_tensor,
-                top_ps=top_ps_tensor,
-                top_ks=top_ks_tensor,
+                mask=curr_mask_tensor
             )
+
             embedder_weight = self.embedder.weight
             if self.config.quant:
                 embedder_weight = (
                     embedder_weight * self.embedder.weight_scaler.unsqueeze(-1))
+                
             next_token_ids = self.sampler(
                 embedding=embedder_weight,
                 hidden_states=hidden_states,
@@ -554,6 +547,7 @@ class GemmaForCausalLM(nn.Module):
                 top_ps=top_ps_tensor,
                 top_ks=top_ks_tensor,
             )
+
             curr_prompt_mask = prompt_mask_tensor.index_select(
                 1, output_index).squeeze(dim=1)
             curr_token_ids = token_ids_tensor.index_select(
@@ -566,8 +560,7 @@ class GemmaForCausalLM(nn.Module):
             input_positions_tensor = output_index.unsqueeze(dim=-1)
             curr_mask_tensor = mask_tensor.index_select(2,
                                                         input_positions_tensor)
-            output_positions_tensor = torch.tensor(0, dtype=torch.int64).to(
-                device)
+            output_positions_tensor = torch.tensor(0, dtype=torch.int64).to(device)
             output_index = output_index + 1
 
         token_ids = token_ids_tensor.tolist()
