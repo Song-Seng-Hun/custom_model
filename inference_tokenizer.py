@@ -2,7 +2,7 @@ import sys, os
 sys.path.append(os.path.dirname(os.path.abspath(os.path.dirname(__file__))))
 from gemma.tokenizer import Tokenizer
 import sentencepiece as spm
-tokenizer = Tokenizer('/home/medi/LLM/gemma_pytorch/tokenizer/tokenizer.model')
+tokenizer = Tokenizer('tokenizer/tokenizer.model')
 lines = [
   "`DEVOCEAN`은 SK그룹의 대표 개발자 커뮤니티이자🧑",
   "내/외부 개발자 간 소통과 성장을 위한 플랫폼을 상징합니다.👋",

@@ -10,7 +10,7 @@ import torch
 # Load the model
 VARIANT = "2b-it" 
 MACHINE_TYPE = "cuda" 
-weights_dir = '/home/medi/LLM/weights' 
+weights_dir = 'weights' 
 
 @contextlib.contextmanager
 def _set_default_tensor_type(dtype: torch.dtype):
