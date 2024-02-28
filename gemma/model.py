@@ -88,7 +88,7 @@ def precompute_freqs_cis(dim: int,
     freqs = 1.0 / (theta**(torch.arange(0, dim, 2)[:(dim // 2)].float() / dim))
     t = torch.arange(end, device=freqs.device)
     freqs = torch.outer(t, freqs).float()
-    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
+    freqs_cis = nn.Parameter(torch.polar(torch.ones_like(freqs), freqs))  # complex64
     # print(freqs_cis.shape)
     return freqs_cis
 
@@ -440,6 +440,7 @@ class GemmaForCausalLM(nn.Module):
                                          max_seq_len * 2,
                                          theta=rope_theta)
         self.register_buffer('freqs_cis', freqs_cis)
+        self.text_results = []
         self.modal = 'text'
 
     def forward(
@@ -567,17 +568,19 @@ class GemmaForCausalLM(nn.Module):
 
         # Detokinization
         token_ids = token_ids_tensor.tolist()
-        results = []
+        self.text_results = []
+        self.text_results = self.text_results
         for i, tokens in enumerate(token_ids):
             trimmed_output = tokens[len(prompt_tokens[i]):len(prompt_tokens[i])
                                     + output_len]
             if self.tokenizer.eos_id in trimmed_output:
                 eos_index = trimmed_output.index(self.tokenizer.eos_id)
                 trimmed_output = trimmed_output[:eos_index]
-            results.append(self.tokenizer.decode(trimmed_output))
+            self.text_results.append(self.tokenizer.decode(trimmed_output))
 
         # If a string was provided as input, return a string as output.
-        return results[0] if is_str_prompt else results
+        return self.text_results[0] if is_str_prompt else self.text_results
+  
     
     def load_weights(self, model_path: str):
         self.load_state_dict(

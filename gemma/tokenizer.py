@@ -11,7 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import os
+import sys, os
+sys.path.append(os.path.dirname(os.path.abspath(os.path.dirname(__file__))))
 from typing import List, Optional
 
 from sentencepiece import SentencePieceProcessor
@@ -91,7 +92,7 @@ class Tokenizer:
 
 
 if __name__ == "__main__":
-    tokenizer = Tokenizer('D:/dev_ws/gemma_pytorch-main/tokenizer/tokenizer.model')
+    tokenizer = Tokenizer('tokenizer/tokenizer.model')
     unused_prompt = ""
     for i in range(0, 100):
         unused_prompt += f"<unused{i}>" 
