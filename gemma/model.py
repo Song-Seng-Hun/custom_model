@@ -434,12 +434,6 @@ class GemmaForCausalLM(nn.Module):
         self.embedder = Embedding(vocab_size, config.hidden_size, config.quant)
         self.model = GemmaModel(config)
         self.sampler = Sampler(vocab_size)
-        self.text_encoder = autoencoder.TextEncoder()
-        self.text_decoder = autoencoder.TextDecoder()
-        self.text_preprocess = autoencoder.TextPreprocess()
-        self.text_generator = autoencoder.TextGenerator()
-        self.encoder1d = autoencoder.Encoder1d()
-        self.generator1d = autoencoder.Generator1d()
         # Pre-compute rotary embedding table.
         rope_theta = getattr(config, 'rope_theta', 10000)
         freqs_cis = precompute_freqs_cis(head_dim,
@@ -448,11 +442,10 @@ class GemmaForCausalLM(nn.Module):
         self.register_buffer('freqs_cis', freqs_cis)
         self.modal = 'text'
 
-    @torch.no_grad()
     def forward(
         self,
-        input_token_ids: torch.Tensor,
-        input_positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        freqs_cis: torch.Tensor,
         kv_write_indices: torch.Tensor,
         kv_caches: List[Tuple[torch.Tensor, torch.Tensor]],
         mask: torch.Tensor,
@@ -462,13 +455,6 @@ class GemmaForCausalLM(nn.Module):
         top_ks: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
-        if self.modal == 'text':
-            freqs_cis = self.freqs_cis.index_select(0, input_positions)
-            freqs_cis, kv_write_indices, hidden_states = self.text_encoder(freqs_cis, input_positions, self.embedder, input_token_ids, self.config.hidden_size)
-
-        # 여기가 대충 encoder 결과물(BS, -1, CH)
-        # print(hidden_states.shape, self.config.hidden_size) # for debug
-
         hidden_states = self.model(
             hidden_states=hidden_states,
             freqs_cis=freqs_cis,
@@ -476,46 +462,125 @@ class GemmaForCausalLM(nn.Module):
             kv_caches=kv_caches,
             mask=mask,
         )
-        if self.modal == 'text':
-            next_tokens = self.text_decoder(self.embedder, self.config.quant, self.sampler, hidden_states, output_positions, temperatures, top_ps, top_ks)
-
-        return next_tokens
+        
+        return hidden_states
 
     def generate(
         self,
-        data: Any,
+        prompts: Union[str, Sequence[str]],
         device: Any,
         output_len: int = 100,
         temperature: float = 0.95,
         top_p: float = 1.0,
         top_k: int = 100,
-    ) -> Any:
+    ) -> Union[str, Sequence[str]]:
         """Generates responses for given prompts using Gemma model."""
-        if self.modal == 'text':
-            is_str_prompt, batch_size, data, min_prompt_len, max_seq_len = self.text_preprocess(data, self.tokenizer, output_len, self.config.max_position_embeddings)
-        elif self.modal == 'audio':
-            dtype = self.config.get_dtype()
-            data = self.encoder1d(data, device, dtype)
-            max_seq_len = data.shape[-2]
-            batch_size = data.shape[0]
+        # If a single prompt is provided, treat it as a batch of 1.
+        is_str_prompt = isinstance(prompts, str)
+        if is_str_prompt:
+            prompts = [prompts]
+
+        batch_size = len(prompts)
+        prompt_tokens = [self.tokenizer.encode(prompt) for prompt in prompts]
+        min_prompt_len = min(len(p) for p in prompt_tokens)
+        max_prompt_len = max(len(p) for p in prompt_tokens)
+        max_seq_len = max_prompt_len + output_len
+        assert max_seq_len <= self.config.max_position_embeddings
 
         # build KV caches
         kv_caches = []
         for _ in range(self.config.num_hidden_layers):
-            size = (batch_size, max_seq_len, self.config.num_key_value_heads, self.config.head_dim)
+            size = (batch_size, max_seq_len, self.config.num_key_value_heads,
+                    self.config.head_dim)
             dtype = self.config.get_dtype()
             k_cache = torch.zeros(size=size, dtype=dtype, device=device)
             v_cache = torch.zeros(size=size, dtype=dtype, device=device)
             kv_caches.append((k_cache, v_cache))
 
-        text_results, audio_results = None, None
         # prepare inputs
-        if self.modal == 'text':
-            text_results = self.text_generator(self.forward, batch_size, max_seq_len, self.tokenizer, min_prompt_len, data, device, temperature, top_p, top_k, kv_caches, output_len, is_str_prompt)
-        elif self.modal == 'audio':
-            audio_results = self.generator1d(self.forward, batch_size, max_seq_len, self.tokenizer, min_prompt_len, data, device, temperature, top_p, top_k, kv_caches, output_len, is_str_prompt)
-        return {'text_results': text_results, 'audio_results': audio_results}
+        token_ids_tensor = torch.full((batch_size, max_seq_len),
+                                      self.tokenizer.pad_id, dtype=torch.int64)
+        input_token_ids_tensor = torch.full((batch_size, min_prompt_len),
+                                            self.tokenizer.pad_id,
+                                            dtype=torch.int64)
+        for i, p in enumerate(prompt_tokens):
+            token_ids_tensor[i, :len(p)] = torch.tensor(p)
+            input_token_ids_tensor[i, :min_prompt_len] = torch.tensor(
+                p[:min_prompt_len])
+        token_ids_tensor = token_ids_tensor.to(device)
+        input_token_ids_tensor = input_token_ids_tensor.to(device)
+        prompt_mask_tensor = token_ids_tensor != self.tokenizer.pad_id
+        input_positions_tensor = torch.arange(0, min_prompt_len,
+                                              dtype=torch.int64).to(device)
+        mask_tensor = torch.full((1, 1, max_seq_len, max_seq_len),
+                                 -2.3819763e38).to(torch.float)
+        mask_tensor = torch.triu(mask_tensor, diagonal=1).to(device)
+        curr_mask_tensor = mask_tensor.index_select(2, input_positions_tensor)
+        output_positions_tensor = torch.LongTensor([min_prompt_len - 1]).to(
+            device)
+        temperatures_tensor = torch.FloatTensor([temperature] * batch_size).to(
+            device)
+        top_ps_tensor = torch.FloatTensor([top_p] * batch_size).to(device)
+        top_ks_tensor = torch.LongTensor([top_k] * batch_size).to(device)
+        output_index = torch.tensor(min_prompt_len, dtype=torch.int64).to(
+            device)
 
+        # Prefill up to min_prompt_len tokens, then treat other prefill as
+        # decode and ignore output.
+        for i in range(max_seq_len - min_prompt_len):
+            # [batch_size, input_len, hidden_size]
+            hidden_states = self.embedder(input_token_ids_tensor)
+            # Gemma normalizes the embedding by sqrt(hidden_size).
+            hidden_states = self(
+                hidden_states=hidden_states*(self.config.hidden_size**0.5),
+                freqs_cis=self.freqs_cis.index_select(0, input_positions_tensor),
+                kv_write_indices=input_positions_tensor,
+                kv_caches=kv_caches,
+                mask=curr_mask_tensor,
+                output_positions=output_positions_tensor,
+                temperatures=temperatures_tensor,
+                top_ps=top_ps_tensor,
+                top_ks=top_ks_tensor,
+            )
+            embedder_weight = self.embedder.weight
+            if self.config.quant:
+                embedder_weight = (
+                    embedder_weight * self.embedder.weight_scaler.unsqueeze(-1))
+            next_token_ids = self.sampler(
+                embedding=embedder_weight,
+                hidden_states=hidden_states,
+                output_positions=output_positions_tensor,
+                temperatures=temperatures_tensor,
+                top_ps=top_ps_tensor,
+                top_ks=top_ks_tensor,
+            )
+            curr_prompt_mask = prompt_mask_tensor.index_select(
+                1, output_index).squeeze(dim=1)
+            curr_token_ids = token_ids_tensor.index_select(
+                1, output_index).squeeze(dim=1)
+            output_token_ids = torch.where(curr_prompt_mask, curr_token_ids,
+                                           next_token_ids).unsqueeze(dim=1)
+            token_ids_tensor.index_copy_(1, output_index, output_token_ids)
+
+            input_token_ids_tensor = output_token_ids
+            input_positions_tensor = output_index.unsqueeze(dim=-1)
+            curr_mask_tensor = mask_tensor.index_select(2,
+                                                        input_positions_tensor)
+            output_positions_tensor = torch.tensor(0, dtype=torch.int64).to(
+                device)
+            output_index = output_index + 1
+
+        token_ids = token_ids_tensor.tolist()
+        results = []
+        for i, tokens in enumerate(token_ids):
+            trimmed_output = tokens[len(prompt_tokens[i]):len(prompt_tokens[i])
+                                    + output_len]
+            if self.tokenizer.eos_id in trimmed_output:
+                eos_index = trimmed_output.index(self.tokenizer.eos_id)
+                trimmed_output = trimmed_output[:eos_index]
+            results.append(self.tokenizer.decode(trimmed_output))
+
+        return results[0] if is_str_prompt else results
     def load_weights(self, model_path: str):
         self.load_state_dict(
             torch.load(
